@@ -1,140 +1,99 @@
+// src/index.js
 import 'dotenv/config';
 import express from 'express';
-import { Client, middleware as lineMiddleware } from '@line/bot-sdk';
-import { MENU } from './menu.js';
+import { Client, middleware } from '@line/bot-sdk';
 
+// --- 1) 讀環境變數（Vercel 上的 Settings > Environment Variables 會設定）
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
+const BASE_URL = process.env.BASE_URL || 'https://line-pos.vercel.app';
+
+// --- 2) 建立 LINE Client + Express app
+const client = new Client(config);
 const app = express();
-app.use('/public', express.static('public'));
-app.use(lineMiddleware(config));
+
+// 讓我們可以接收 JSON
 app.use(express.json());
 
-const client = new Client(config);
-
-// In-memory carts: userId -> { items: [{id, name, price, qty}] }
-const carts = new Map();
-
-function getCart(userId) {
-  if (!carts.has(userId)) carts.set(userId, { items: [] });
-  return carts.get(userId);
-}
-
-function addItemToCart(userId, itemId) {
-  const cart = getCart(userId);
-  const item = MENU.find(x => x.id === itemId);
-  if (!item) return false;
-  const found = cart.items.find(x => x.id === itemId);
-  if (found) found.qty += 1;
-  else cart.items.push({ id: item.id, name: item.name, price: item.price, qty: 1 });
-  return true;
-}
-
-function cartSummary(userId) {
-  const cart = getCart(userId);
-  if (cart.items.length === 0) return '購物車是空的。請輸入 "menu" 開始點餐。';
-  const lines = cart.items.map(i => `• ${i.name} x${i.qty} - $${i.price * i.qty}`);
-  const total = cart.items.reduce((s, i) => s + i.price * i.qty, 0);
-  return lines.join('\n') + `\n\n合計：$${total}`;
-}
-
-function quickReplyMenu() {
-  return {
-    items: MENU.slice(0, 12).map(m => ({
-      type: 'action',
-      action: {
-        type: 'message',
-        label: `${m.name} $${m.price}`,
-        text: `add ${m.id}`
-      }
-    }))
-  };
-}
-
-app.post('/webhook', async (req, res) => {
-  const events = req.body.events || [];
-  await Promise.all(events.map(handleEvent));
-  res.status(200).end();
+// --- 3) Webhook 路由：一定要有，而且要用 @line/bot-sdk 的 middleware
+app.post('/webhook', middleware(config), async (req, res) => {
+  try {
+    const results = await Promise.all(
+      req.body.events.map(handleEvent)
+    );
+    return res.json(results);
+  } catch (err) {
+    console.error('Webhook Error:', err);
+    return res.status(500).end();
+  }
 });
 
+// 方便你手動檢查服務是否活著（GET）
+app.get('/health', (req, res) => {
+  res.status(200).send('ok');
+});
+
+// --- 4) 你的商業流程 / 付款模擬路由（舉例）
+app.get('/pay/mock', (req, res) => {
+  // 給個簡單頁面示意成功/取消按鈕
+  const successUrl = `${BASE_URL}/public/success.html`;
+  const cancelUrl = `${BASE_URL}/public/cancel.html`;
+
+  const html = `
+<!doctype html>
+<html>
+  <body>
+    <h2>付款模擬頁面</h2>
+    <p><a href="${successUrl}">成功</a></p>
+    <p><a href="${cancelUrl}">取消</a></p>
+  </body>
+</html>`;
+  res.type('html').send(html);
+});
+
+// 如果你想讓 public 裡的文件可被存取，打開這行：
+// app.use('/public', express.static('public'));
+
+// --- 5) 事件處理（最少要處理 Text 類型，否則會 200 但沒有反應）
 async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') return;
-  const userId = event.source.userId;
-  const text = event.message.text.trim().toLowerCase();
+  if (event.type !== 'message' || event.message.type !== 'text') {
+    // 不處理非文字
+    return Promise.resolve(null);
+  }
+
+  const text = (event.message.text || '').trim().toLowerCase();
+
+  if (text === 'help' || text === '？' || text === '?') {
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '指令：menu / 加入 / 結帳 / help',
+    });
+  }
 
   if (text === 'menu') {
-    const menuText = MENU.map(m => `• ${m.name}（id: ${m.id}）$${m.price}`).join('\n');
-    return client.replyMessage(event.replyToken, [
-      { type: 'text', text: '請選擇商品（點 Quick Reply 也可快速加入）：', quickReply: quickReplyMenu() },
-      { type: 'text', text: menuText }
-    ]);
-  }
-
-  if (text.startsWith('add ')) {
-    const id = text.split(' ')[1];
-    const ok = addItemToCart(userId, id);
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: ok ? `已加入：${id}\n\n輸入 "cart" 查看購物車，或輸入 "checkout" 結帳。` : '找不到此商品 id。請輸入 "menu" 查看清單。'
+      text: '這裡可以回傳你的菜單、加入購物車方式等說明。',
     });
   }
 
-  if (text === 'cart') {
+  if (text === '結帳' || text === 'pay') {
+    const url = `${BASE_URL}/pay/mock`;
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: cartSummary(userId)
+      text: `前往付款：${url}`,
     });
   }
 
-  if (text === 'checkout') {
-    const cart = getCart(userId);
-    if (cart.items.length === 0) {
-      return client.replyMessage(event.replyToken, { type: 'text', text: '購物車是空的，先輸入 "menu" 點餐吧！' });
-    }
-    const total = cart.items.reduce((s, i) => s + i.price * i.qty, 0);
-    const base = process.env.BASE_URL || 'http://localhost:3000';
-    const successUrl = `${base}/public/success.html`;
-    const cancelUrl  = `${base}/public/cancel.html`;
-    const payUrl = `${base}/pay/mock?amount=${total}&success=${encodeURIComponent(successUrl)}&cancel=${encodeURIComponent(cancelUrl)}`;
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: `模擬付款金額：$${total}\n請點擊連結付款（模擬）：\n${payUrl}`
-    });
-  }
-
-  // help
-  if (text === 'help' || text === '？' || text === '？') {
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: '指令：\nmenu：顯示菜單\nadd <id>：加入商品\ncart：查看購物車\ncheckout：模擬結帳'
-    });
-  }
-
-  // default
+  // 預設
   return client.replyMessage(event.replyToken, {
     type: 'text',
-    text: '嗨～輸入 "menu" 開始點餐；或 "help" 看指令。'
+    text: `你說的是：${event.message.text}\n(輸入 help 看說明)`,
   });
 }
 
-// Mock payment endpoint: redirect to success or cancel
-app.get('/pay/mock', (req, res) => {
-  const { amount, success, cancel } = req.query;
-  const html = `
-    <html><body>
-      <h2>模擬付款頁</h2>
-      <p>金額：$${amount || 0}</p>
-      <a href="${success || '/public/success.html'}">模擬付款成功</a>
-      <br/>
-      <a href="${cancel || '/public/cancel.html'}">模擬取消</a>
-    </body></html>`;
-  res.send(html);
-});
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server started on :${port}`);
-});
+// --- 6) 匯出給 Vercel（絕對不能 app.listen） ---
+export default app;
